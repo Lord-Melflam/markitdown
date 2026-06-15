@@ -9,6 +9,8 @@ from .._exceptions import MissingDependencyException, MISSING_DEPENDENCY_MESSAGE
 
 # Pattern for MasterFormat-style partial numbering (e.g., ".1", ".2", ".10")
 PARTIAL_NUMBERING_PATTERN = re.compile(r"^\.\d+$")
+_BULLET_MARKERS = {"•", "▪", "‣", "◦", "-", "*", "–", "—"}
+_FORM_PAGE_RATIO_THRESHOLD = 0.4
 
 
 def _merge_partial_numbering_lines(text: str) -> str:
@@ -171,10 +173,13 @@ def _extract_form_content_from_words(page: Any) -> str | None:
         # Check for MasterFormat-style partial numbering (e.g., ".1", ".2")
         # These should be treated as list items, not table rows
         has_partial_numbering = False
+        has_bullet_marker = False
         if row_words:
             first_word = row_words[0]["text"].strip()
             if PARTIAL_NUMBERING_PATTERN.match(first_word):
                 has_partial_numbering = True
+            if first_word in _BULLET_MARKERS:
+                has_bullet_marker = True
 
         row_info.append(
             {
@@ -185,8 +190,16 @@ def _extract_form_content_from_words(page: Any) -> str | None:
                 "is_paragraph": is_paragraph,
                 "num_columns": len(x_groups),
                 "has_partial_numbering": has_partial_numbering,
+                "has_bullet_marker": has_bullet_marker,
             }
         )
+
+    # Slide-style PDFs often render bullets as separate word groups across
+    # columns. Treat those pages as prose so we preserve reading order instead
+    # of turning every bullet line into a faux table row.
+    bullet_row_count = sum(1 for info in row_info if info["has_bullet_marker"])
+    if row_info and bullet_row_count / len(row_info) >= 0.15:
+        return None
 
     # Collect ALL x-positions from rows with 3+ columns (table-like rows)
     # This gives us the global column structure
@@ -265,6 +278,10 @@ def _extract_form_content_from_words(page: Any) -> str | None:
 
         # Rows with partial numbering (e.g., ".1", ".2") are list items, not table rows
         if info["has_partial_numbering"]:
+            info["is_table_row"] = False
+            continue
+
+        if info["has_bullet_marker"]:
             info["is_table_row"] = False
             continue
 
@@ -547,10 +564,10 @@ class PdfConverter(DocumentConverter):
             # keep memory usage constant regardless of page count.
             markdown_chunks: list[str] = []
             form_page_count = 0
-            plain_page_indices: list[int] = []
 
             with pdfplumber.open(pdf_bytes) as pdf:
-                for page_idx, page in enumerate(pdf.pages):
+                total_pages = len(pdf.pages)
+                for page in pdf.pages:
                     page_content = _extract_form_content_from_words(page)
 
                     if page_content is not None:
@@ -558,16 +575,17 @@ class PdfConverter(DocumentConverter):
                         if page_content.strip():
                             markdown_chunks.append(page_content)
                     else:
-                        plain_page_indices.append(page_idx)
                         text = page.extract_text()
                         if text and text.strip():
                             markdown_chunks.append(text.strip())
 
                     page.close()  # Free cached page data immediately
 
-            # If no pages had form-style content, use pdfminer for
-            # the whole document (better text spacing for prose).
-            if form_page_count == 0:
+            # If the document is mostly prose, use pdfminer for the whole
+            # file instead of mixing in table reconstruction. This keeps slide
+            # decks and other text-heavy PDFs in reading order and avoids
+            # turning bullet lists into pseudo-tables.
+            if total_pages == 0 or (form_page_count / total_pages) < _FORM_PAGE_RATIO_THRESHOLD:
                 pdf_bytes.seek(0)
                 markdown = pdfminer.high_level.extract_text(pdf_bytes)
             else:

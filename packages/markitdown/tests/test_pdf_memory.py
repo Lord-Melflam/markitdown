@@ -17,6 +17,7 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 from markitdown import MarkItDown
+from markitdown.converters._pdf_converter import _extract_form_content_from_words
 
 TEST_FILES_DIR = os.path.join(os.path.dirname(__file__), "test_files")
 
@@ -67,6 +68,25 @@ def _make_plain_page():
     return page
 
 
+def _make_bullet_page():
+    """Create a mock page with bullet-style slide content."""
+    page = MagicMock()
+    page.width = 612
+    page.close = MagicMock()
+    page.extract_words.return_value = [
+        {"text": "▪", "x0": 40, "x1": 50, "top": 10, "bottom": 20},
+        {"text": "Possible", "x0": 70, "x1": 120, "top": 10, "bottom": 20},
+        {"text": "actions", "x0": 125, "x1": 170, "top": 10, "bottom": 20},
+        {"text": "▪", "x0": 40, "x1": 50, "top": 30, "bottom": 40},
+        {"text": "Accept:", "x0": 70, "x1": 110, "top": 30, "bottom": 40},
+        {"text": "\"It's okay if somebody steals our USB sticks\"", "x0": 120, "x1": 450, "top": 30, "bottom": 40},
+        {"text": "▪", "x0": 40, "x1": 50, "top": 50, "bottom": 60},
+        {"text": "Avoid:", "x0": 70, "x1": 100, "top": 50, "bottom": 60},
+        {"text": "\"We will stop using USB sticks\"", "x0": 110, "x1": 320, "top": 50, "bottom": 60},
+    ]
+    return page
+
+
 def _mock_pdfplumber_open(pages):
     """Return a mock pdfplumber.open that yields the given pages."""
 
@@ -82,6 +102,36 @@ def _mock_pdfplumber_open(pages):
 
 class TestPdfMemoryOptimization:
     """Test that PDF conversion cleans up per-page caches to limit memory."""
+
+    def test_bullet_heavy_page_is_not_treated_as_form(self):
+        """Bullet-heavy slide content should fall back to prose extraction."""
+        page = _make_bullet_page()
+
+        assert _extract_form_content_from_words(page) is None
+
+    def test_mostly_plain_pdf_uses_pdfminer_for_the_whole_document(self):
+        """Mostly prose PDFs should not mix in table reconstruction."""
+        pages = [_make_form_page()] + [_make_plain_page() for _ in range(4)]
+
+        with patch(
+            "markitdown.converters._pdf_converter.pdfplumber"
+        ) as mock_pdfplumber, patch(
+            "markitdown.converters._pdf_converter.pdfminer"
+        ) as mock_pdfminer:
+            mock_pdfplumber.open.side_effect = _mock_pdfplumber_open(pages)
+            mock_pdfminer.high_level.extract_text.return_value = "Whole document text"
+
+            md = MarkItDown()
+            buf = io.BytesIO(b"fake pdf content")
+            from markitdown import StreamInfo
+
+            result = md.convert_stream(
+                buf,
+                stream_info=StreamInfo(extension=".pdf", mimetype="application/pdf"),
+            )
+
+        assert mock_pdfminer.high_level.extract_text.called
+        assert result.text_content == "Whole document text"
 
     def test_page_close_called_on_every_page(self):
         """Verify page.close() is called on every page during conversion.
