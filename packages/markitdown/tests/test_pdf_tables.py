@@ -1,13 +1,35 @@
 #!/usr/bin/env python3 -m pytest
 """Tests for PDF table extraction functionality."""
 
+import io
 import os
 import re
 import pytest
 
-from markitdown import MarkItDown
+from markitdown import DocumentConverterResult, MarkItDown
+from markitdown.converters._pdf_converter import (
+    _convert_legacy,
+    _merge_partial_numbering_lines,
+)
 
 TEST_FILES_DIR = os.path.join(os.path.dirname(__file__), "test_files")
+
+
+class _LegacyPdfConverter:
+    """Adapter that runs the legacy pdfplumber/pdfminer PDF path.
+
+    The tests in this module characterize the legacy form-heuristic table
+    extractor. That extractor is now the *fallback* behind PyMuPDF4LLM (the
+    primary path, which emits differently-shaped Markdown), so these tests
+    exercise the legacy path directly to keep guarding it. Exposes the same
+    ``convert(path).text_content`` surface the tests rely on.
+    """
+
+    def convert(self, path: str) -> DocumentConverterResult:
+        with open(path, "rb") as f:
+            markdown = _convert_legacy(io.BytesIO(f.read()))
+        markdown = _merge_partial_numbering_lines(markdown)
+        return DocumentConverterResult(markdown=markdown)
 
 
 # --- Helper Functions ---
@@ -100,7 +122,7 @@ class TestPdfTableExtraction:
     @pytest.fixture
     def markitdown(self):
         """Create MarkItDown instance."""
-        return MarkItDown()
+        return _LegacyPdfConverter()
 
     def test_borderless_table_extraction(self, markitdown):
         """Test extraction of borderless tables from SPARSE inventory PDF.
@@ -725,7 +747,7 @@ class TestPdfFullOutputComparison:
     @pytest.fixture
     def markitdown(self):
         """Create MarkItDown instance."""
-        return MarkItDown()
+        return _LegacyPdfConverter()
 
     def test_movie_theater_full_output(self, markitdown):
         """Test complete output for movie theater booking PDF."""
@@ -984,7 +1006,7 @@ class TestPdfTableMarkdownFormat:
     @pytest.fixture
     def markitdown(self):
         """Create MarkItDown instance."""
-        return MarkItDown()
+        return _LegacyPdfConverter()
 
     def test_markdown_table_has_pipe_format(self, markitdown):
         """Test that form-style PDFs have pipe-separated format."""
@@ -1043,7 +1065,7 @@ class TestPdfTableStructureConsistency:
     @pytest.fixture
     def markitdown(self):
         """Create MarkItDown instance."""
-        return MarkItDown()
+        return _LegacyPdfConverter()
 
     def test_borderless_table_structure(self, markitdown):
         """Test that borderless table PDF has pipe-separated structure."""

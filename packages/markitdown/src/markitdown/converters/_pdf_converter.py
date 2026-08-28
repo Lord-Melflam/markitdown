@@ -68,6 +68,18 @@ try:
 except ImportError:
     _dependency_exc_info = sys.exc_info()
 
+# PyMuPDF4LLM is the preferred extraction path: it reconstructs headings,
+# nested lists, tables and reading order from font/position data, which the
+# pdfminer/pdfplumber pipeline below cannot. It is loaded separately so its
+# absence degrades gracefully to the legacy path rather than disabling PDF
+# support entirely.
+_pymupdf4llm_exc_info = None
+try:
+    import pymupdf
+    import pymupdf4llm
+except ImportError:
+    _pymupdf4llm_exc_info = sys.exc_info()
+
 
 ACCEPTED_MIME_TYPE_PREFIXES = [
     "application/pdf",
@@ -556,52 +568,90 @@ class PdfConverter(DocumentConverter):
         # Read file stream into BytesIO for compatibility with pdfplumber
         pdf_bytes = io.BytesIO(file_stream.read())
 
-        try:
-            # Single pass: check every page for form-style content.
-            # Pages with tables/forms get rich extraction; plain-text
-            # pages are collected separately. page.close() is called
-            # after each page to free pdfplumber's cached objects and
-            # keep memory usage constant regardless of page count.
-            markdown_chunks: list[str] = []
-            form_page_count = 0
+        # Primary path: PyMuPDF4LLM preserves document structure (headings,
+        # nested lists, tables, reading order). Fall back to the legacy
+        # pdfplumber/pdfminer pipeline if it is unavailable or fails.
+        markdown = _convert_with_pymupdf4llm(pdf_bytes)
 
-            with pdfplumber.open(pdf_bytes) as pdf:
-                total_pages = len(pdf.pages)
-                for page in pdf.pages:
-                    page_content = _extract_form_content_from_words(page)
-
-                    if page_content is not None:
-                        form_page_count += 1
-                        if page_content.strip():
-                            markdown_chunks.append(page_content)
-                    else:
-                        text = page.extract_text()
-                        if text and text.strip():
-                            markdown_chunks.append(text.strip())
-
-                    page.close()  # Free cached page data immediately
-
-            # If the document is mostly prose, use pdfminer for the whole
-            # file instead of mixing in table reconstruction. This keeps slide
-            # decks and other text-heavy PDFs in reading order and avoids
-            # turning bullet lists into pseudo-tables.
-            if total_pages == 0 or (form_page_count / total_pages) < _FORM_PAGE_RATIO_THRESHOLD:
-                pdf_bytes.seek(0)
-                markdown = pdfminer.high_level.extract_text(pdf_bytes)
-            else:
-                markdown = "\n\n".join(markdown_chunks).strip()
-
-        except Exception:
-            # Fallback if pdfplumber fails
-            pdf_bytes.seek(0)
-            markdown = pdfminer.high_level.extract_text(pdf_bytes)
-
-        # Fallback if still empty
-        if not markdown:
-            pdf_bytes.seek(0)
-            markdown = pdfminer.high_level.extract_text(pdf_bytes)
+        if not (markdown and markdown.strip()):
+            markdown = _convert_legacy(pdf_bytes)
 
         # Post-process to merge MasterFormat-style partial numbering with following text
         markdown = _merge_partial_numbering_lines(markdown)
 
         return DocumentConverterResult(markdown=markdown)
+
+
+def _convert_with_pymupdf4llm(pdf_bytes: io.BytesIO) -> str | None:
+    """Convert a PDF to Markdown with PyMuPDF4LLM.
+
+    Returns the Markdown string, or None if PyMuPDF4LLM is unavailable or
+    raises (so the caller can fall back to the legacy pipeline).
+    """
+    if _pymupdf4llm_exc_info is not None:
+        return None
+
+    try:
+        pdf_bytes.seek(0)
+        doc = pymupdf.open(stream=pdf_bytes.read(), filetype="pdf")
+        try:
+            # show_progress=False keeps the library from writing to stdout.
+            return pymupdf4llm.to_markdown(doc, show_progress=False)
+        finally:
+            doc.close()
+    except Exception:
+        return None
+
+
+def _convert_legacy(pdf_bytes: io.BytesIO) -> str:
+    """Extract Markdown using the pdfplumber form heuristic + pdfminer fallback.
+
+    Used when PyMuPDF4LLM is unavailable or produces no output.
+    """
+    pdf_bytes.seek(0)
+    try:
+        # Single pass: check every page for form-style content.
+        # Pages with tables/forms get rich extraction; plain-text
+        # pages are collected separately. page.close() is called
+        # after each page to free pdfplumber's cached objects and
+        # keep memory usage constant regardless of page count.
+        markdown_chunks: list[str] = []
+        form_page_count = 0
+
+        with pdfplumber.open(pdf_bytes) as pdf:
+            total_pages = len(pdf.pages)
+            for page in pdf.pages:
+                page_content = _extract_form_content_from_words(page)
+
+                if page_content is not None:
+                    form_page_count += 1
+                    if page_content.strip():
+                        markdown_chunks.append(page_content)
+                else:
+                    text = page.extract_text()
+                    if text and text.strip():
+                        markdown_chunks.append(text.strip())
+
+                page.close()  # Free cached page data immediately
+
+        # If the document is mostly prose, use pdfminer for the whole
+        # file instead of mixing in table reconstruction. This keeps slide
+        # decks and other text-heavy PDFs in reading order and avoids
+        # turning bullet lists into pseudo-tables.
+        if total_pages == 0 or (form_page_count / total_pages) < _FORM_PAGE_RATIO_THRESHOLD:
+            pdf_bytes.seek(0)
+            markdown = pdfminer.high_level.extract_text(pdf_bytes)
+        else:
+            markdown = "\n\n".join(markdown_chunks).strip()
+
+    except Exception:
+        # Fallback if pdfplumber fails
+        pdf_bytes.seek(0)
+        markdown = pdfminer.high_level.extract_text(pdf_bytes)
+
+    # Fallback if still empty
+    if not markdown:
+        pdf_bytes.seek(0)
+        markdown = pdfminer.high_level.extract_text(pdf_bytes)
+
+    return markdown

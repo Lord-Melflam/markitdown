@@ -16,8 +16,11 @@ import tracemalloc
 import pytest
 from unittest.mock import patch, MagicMock
 
-from markitdown import MarkItDown
-from markitdown.converters._pdf_converter import _extract_form_content_from_words
+from markitdown import MarkItDown, StreamInfo
+from markitdown.converters._pdf_converter import (
+    _convert_legacy,
+    _extract_form_content_from_words,
+)
 
 TEST_FILES_DIR = os.path.join(os.path.dirname(__file__), "test_files")
 
@@ -297,7 +300,12 @@ class TestPdfMemoryOptimization:
         reason="test.pdf not available",
     )
     def test_real_pdf_page_cleanup(self):
-        """Integration test: verify page.close() is called with a real PDF."""
+        """Integration test: verify page.close() is called in the legacy path.
+
+        PyMuPDF4LLM is the primary converter now, so this exercises the
+        pdfplumber fallback (`_convert_legacy`) directly — that path is where
+        the per-page cleanup fix lives.
+        """
         import pdfplumber
 
         close_call_count = 0
@@ -309,13 +317,12 @@ class TestPdfMemoryOptimization:
             original_close(self)
 
         with patch.object(pdfplumber.page.Page, "close", tracking_close):
-            md = MarkItDown()
-            pdf_path = os.path.join(TEST_FILES_DIR, "test.pdf")
-            md.convert(pdf_path)
+            with open(os.path.join(TEST_FILES_DIR, "test.pdf"), "rb") as f:
+                _convert_legacy(io.BytesIO(f.read()))
 
         assert (
             close_call_count > 0
-        ), "page.close() was never called during PDF conversion"
+        ), "page.close() was never called during legacy PDF conversion"
 
 
 def _generate_table_pdf(num_pages: int) -> bytes:
@@ -356,17 +363,15 @@ class TestPdfMemoryBenchmark:
         Without page.close(), 200 pages uses ~225 MiB (linear growth).
         With the fix, peak memory should stay under 30 MiB.
         """
-        from markitdown import StreamInfo
-
         num_pages = 200
         pdf_bytes = _generate_table_pdf(num_pages)
 
         gc.collect()
         tracemalloc.start()
 
-        md = MarkItDown()
-        buf = io.BytesIO(pdf_bytes)
-        md.convert_stream(buf, stream_info=StreamInfo(extension=".pdf"))
+        # Target the legacy pdfplumber path directly: that is where the
+        # page.close() memory fix lives (PyMuPDF4LLM is the primary path now).
+        _convert_legacy(io.BytesIO(pdf_bytes))
 
         _, peak = tracemalloc.get_traced_memory()
         tracemalloc.stop()
@@ -386,8 +391,6 @@ class TestPdfMemoryBenchmark:
         Converts 50-page and 200-page PDFs and asserts the peak memory
         ratio is much less than the 4x page count ratio.
         """
-        from markitdown import StreamInfo
-
         results = {}
         for num_pages in [50, 200]:
             pdf_bytes = _generate_table_pdf(num_pages)
@@ -395,9 +398,7 @@ class TestPdfMemoryBenchmark:
             gc.collect()
             tracemalloc.start()
 
-            md = MarkItDown()
-            buf = io.BytesIO(pdf_bytes)
-            md.convert_stream(buf, stream_info=StreamInfo(extension=".pdf"))
+            _convert_legacy(io.BytesIO(pdf_bytes))
 
             _, peak = tracemalloc.get_traced_memory()
             tracemalloc.stop()
@@ -412,3 +413,68 @@ class TestPdfMemoryBenchmark:
             f"50p={results[50] / 1024 / 1024:.1f} MiB, "
             f"200p={results[200] / 1024 / 1024:.1f} MiB"
         )
+
+
+def _has_pymupdf4llm() -> bool:
+    try:
+        import pymupdf4llm  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+@pytest.mark.skipif(
+    not _has_fpdf2() or not _has_pymupdf4llm(),
+    reason="fpdf2 and pymupdf4llm required",
+)
+class TestPyMuPdf4LlmPrimaryPath:
+    """The primary path is PyMuPDF4LLM; the pdfplumber pipeline is a fallback."""
+
+    def test_primary_path_preserves_structure(self):
+        """PyMuPDF4LLM should reconstruct Markdown headings from a real PDF.
+
+        The legacy pdfplumber/pdfminer path emits flat text with no `#`
+        headings, so their presence proves the PyMuPDF4LLM path ran.
+        """
+        from fpdf import FPDF
+
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Helvetica", style="B", size=24)
+        pdf.cell(0, 20, "Chapter Title")
+        pdf.ln(20)
+        pdf.set_font("Helvetica", size=12)
+        pdf.multi_cell(0, 8, "Some ordinary body text under the heading.")
+        pdf_bytes = pdf.output()
+
+        md = MarkItDown()
+        result = md.convert_stream(
+            io.BytesIO(pdf_bytes), stream_info=StreamInfo(extension=".pdf")
+        )
+
+        assert "Chapter Title" in result.text_content
+        assert any(
+            line.lstrip().startswith("#") for line in result.text_content.splitlines()
+        ), "Expected a Markdown heading from the PyMuPDF4LLM path"
+
+    def test_falls_back_to_legacy_when_primary_returns_nothing(self):
+        """If PyMuPDF4LLM yields empty output, the legacy path is used."""
+        pages = [_make_form_page() for _ in range(3)]
+
+        with patch(
+            "markitdown.converters._pdf_converter._convert_with_pymupdf4llm",
+            return_value=None,
+        ), patch(
+            "markitdown.converters._pdf_converter.pdfplumber"
+        ) as mock_pdfplumber:
+            mock_pdfplumber.open.side_effect = _mock_pdfplumber_open(pages)
+
+            md = MarkItDown()
+            result = md.convert_stream(
+                io.BytesIO(b"fake pdf content"),
+                stream_info=StreamInfo(extension=".pdf", mimetype="application/pdf"),
+            )
+
+        assert mock_pdfplumber.open.called, "Legacy fallback should call pdfplumber"
+        assert "|" in result.text_content
